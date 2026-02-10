@@ -86,7 +86,7 @@ impl<'a> Decoder for ArwDecoder<'a> {
       _ => return Err(format!("ARW: Don't know how to decode type {}", compression).to_string()),
     };
 
-    ok_image_with_black_white(camera, width, height, self.get_wb()?, black, white, image)
+    ok_image_with_black_white(camera, width, height, self.get_wb()?, black, white, offset, bps, Encoding::NotImplemented, image)
   }
 }
 
@@ -125,7 +125,7 @@ impl<'a> ArwDecoder<'a> {
       currpos += len+8;
     }
 
-    ok_image(camera, width, height, wb_coeffs, image)
+    ok_image(camera, width, height, wb_coeffs, offset, 0, Encoding::NotImplemented, image)
   }
 
   fn image_srf(&self, camera: Camera, dummy: bool) -> Result<RawImage,String> {
@@ -159,7 +159,7 @@ impl<'a> ArwDecoder<'a> {
       decode_16be(&image_data, width, height, dummy)
     };
 
-    ok_image(camera, width, height, [NAN,NAN,NAN,NAN], image)
+    ok_image(camera, width, height, [NAN,NAN,NAN,NAN], 0, 0, Encoding::NotImplemented, image)
   }
 
   pub(crate) fn decode_arw1(buf: &[u8], width: usize, height: usize, dummy: bool) -> Vec<u16> {
@@ -263,7 +263,7 @@ impl<'a> ArwDecoder<'a> {
     let mut out = vec![0 as u16; curve[5]+1];
     for i in 0..5 {
       for j in (curve[i]+1)..(curve[i+1]+1) {
-        out[j] = out[j-1] + (1<<i);
+        out[j] = out[(j-1)] + (1<<i);
       }
     }
 
