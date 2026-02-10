@@ -8,7 +8,20 @@ fn main() {
   }
   let file = &args[1];
   match rawloader::decode_file(file) {
-    Ok(_)  => println!("OK file"),
-    Err(_) => println!("FAILED file"),
+    Ok(image)  => {
+      if env::var("VERBOSE").is_ok() {
+        println!("make: {}", image.make);
+        println!("model: {}", image.model);
+        println!("width: {}", image.width);
+        println!("height: {}", image.height);
+        println!("cfa: {}", image.cfa.name);
+        println!("crops: {:?}", image.crops);
+        println!("blacklevels: {:?}", image.blacklevels);
+        println!("whitelevels: {:?}", image.whitelevels);
+        println!("wb_coeffs: {:?}", image.wb_coeffs);
+      }
+      println!("OK file");
+    },
+    Err(e) => println!("FAILED file: {}", e),
   }
 }

@@ -7,6 +7,8 @@ RAWBASE="https://raw.pixls.us/data/"
 FILELIST = File.expand_path('filelist.sha1', File.dirname(__FILE__))
 FILENUM = File.open(FILELIST).each.count
 
+MISSING_FILES = []
+
 def download_file(hash, file, location)
   existhash = nil
   if File.exists?(file)
@@ -14,13 +16,17 @@ def download_file(hash, file, location)
   end
   if existhash != hash
     puts "Downloading file \"#{file}\"!"
-    system "curl -g -f -# \"#{RAWBASE+location.gsub(" ","%20")}\" --create-dirs -o \"#{file}\""
+    if !system "curl -g -f -L -# \"#{RAWBASE+location.gsub(" ","%20")}\" --create-dirs -o \"#{file}\""
+      MISSING_FILES << location
+      return false
+    end
     newhash = IO.popen("sha1sum \"#{file}\"").read.split(" ")[0]
     if newhash != hash
       $stderr.puts "== Download checksum failed, aborting run"
       exit 2
     end
   end
+  true
 end
 
 FILES = {}
@@ -46,7 +52,9 @@ end
 
 $stderr.puts "== Fetching raw file samples"
 each_sample do |hash, file, location|
-  download_file(hash, file, location)
+  if !download_file(hash, file, location)
+    FILES.delete(hash)
+  end
 end
 
 $stderr.puts "== Compiling rawloader"
@@ -108,3 +116,8 @@ Dir["#{known_good_output}/*"].each_with_index do |output, i|
   $stderr.write "Processed file #{i+1} of #{numfiles} -- good #{ngood} bad #{nbad}"
 end
 $stderr.write "\n"
+
+if !MISSING_FILES.empty?
+  $stderr.puts "== #{MISSING_FILES.size} file(s) could not be downloaded:"
+  MISSING_FILES.each { |url| puts "#{RAWBASE}#{url}" }
+end
