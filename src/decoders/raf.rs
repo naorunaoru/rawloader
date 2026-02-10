@@ -4,6 +4,9 @@ use crate::decoders::*;
 use crate::decoders::tiff::*;
 use crate::decoders::basics::*;
 
+
+extern crate web_sys;
+
 #[derive(Debug, Clone)]
 pub struct RafDecoder<'a> {
   buffer: &'a [u8],
@@ -48,7 +51,75 @@ impl<'a> Decoder for RafDecoder<'a> {
       decode_12be_msb32(src, width, height, dummy)
     } else {
       if src.len() < bps*width*height/8 {
-        return Err("RAF: Don't know how to decode compressed yet".to_string())
+        // Compressed RAF — find the Fuji compressed header (0x4953 signature)
+        let mut comp_offset = None;
+        for i in 0..src.len().saturating_sub(16).min(100000) {
+          if src[i] == 0x49 && src[i+1] == 0x53 && src[i+2] == 1 && (src[i+3] == 0 || src[i+3] == 16) {
+            comp_offset = Some(i);
+            break;
+          }
+        }
+        return match comp_offset {
+          Some(off) => {
+            let image = super::fuji_compressed::decode_fuji_compressed(&src[off..], width, height, dummy)?;
+            let mut camera = camera;
+            // The Fuji compressed decompressor always outputs pixels at a fixed
+            // CFA phase (matching rawpy/libraw), which may differ from the phase
+            // in rawloader's camera TOML. Override the CFA to match the
+            // decompressor's output so downstream WB/demosaic use correct channels.
+            camera.cfa = cfa::CFA::new("GGRGGBGGBGGRBRGRBGGGBGGRGGRGGBRBGBRG");
+            // The decompressed output includes the full sensor with zero-filled
+            // borders (optical black padding) that the TOML crops may not account
+            // for. Detect and skip zero rows/columns so they don't produce noise.
+            if !dummy {
+              let mut top_skip = 0;
+              for y in 0..height.min(24) {
+                if image[y * width..(y + 1) * width].iter().all(|&v| v == 0) {
+                  top_skip = y + 1;
+                } else {
+                  break;
+                }
+              }
+              let mut bot_skip = 0;
+              for y in (height.saturating_sub(24)..height).rev() {
+                if image[y * width..(y + 1) * width].iter().all(|&v| v == 0) {
+                  bot_skip = height - y;
+                } else {
+                  break;
+                }
+              }
+              // Sample every 6th row for column checks (aligned to CFA period).
+              // Zero columns are fully zero from decompressor, so sparse sampling
+              // is sufficient and avoids scanning all ~4000 rows per column.
+              let sample_rows: Vec<usize> = (0..height).step_by(6).collect();
+              let mut right_skip = 0;
+              for x in (width.saturating_sub(256)..width).rev() {
+                if sample_rows.iter().all(|&y| image[y * width + x] == 0) {
+                  right_skip = width - x;
+                } else {
+                  break;
+                }
+              }
+              let mut left_skip = 0;
+              for x in 0..width.min(256) {
+                if sample_rows.iter().all(|&y| image[y * width + x] == 0) {
+                  left_skip = x + 1;
+                } else {
+                  break;
+                }
+              }
+              // Use detected zero boundaries directly — the decompressor
+              // produces clean zero borders, so these are always correct
+              // and override potentially wrong TOML values.
+              camera.crops[0] = top_skip;
+              camera.crops[1] = right_skip;
+              camera.crops[2] = bot_skip;
+              camera.crops[3] = left_skip;
+            }
+            ok_image(camera, width, height, self.get_wb()?, offset, bps, Encoding::Fuji, image)
+          },
+          None => Err("RAF: Compressed but could not find Fuji compressed header".to_string()),
+        };
       }
       match bps {
         12 => decode_12le(src, width, height, dummy),
@@ -81,11 +152,14 @@ impl<'a> Decoder for RafDecoder<'a> {
         xyz_to_cam: camera.xyz_to_cam,
         cfa: camera.cfa.clone(),
         crops: [0,0,0,0],
+        bps: bps,
+        offset: offset,
         blackareas: Vec::new(),
         orientation: camera.orientation,
+        encoding: Encoding::Fuji
       })
     } else {
-      ok_image(camera, width, height, self.get_wb()?, image)
+      ok_image(camera, width, height, self.get_wb()?, offset, bps, Encoding::Fuji, image)
     }
   }
 }
@@ -142,5 +216,38 @@ impl<'a> RafDecoder<'a> {
 
       (rotatedwidth, rotatedheight, out)
     }
+  }
+}
+
+
+pub struct RafEncoder {
+  original: Vec<u8>,
+  bps: usize,
+  offset: usize,
+}
+
+impl RafEncoder {
+  pub fn new(original: Vec<u8>, bps: usize, offset: usize) -> RafEncoder {
+    RafEncoder{
+      original,
+      bps,
+      offset
+    }
+  }
+}
+
+impl Encoder for RafEncoder {
+  fn encode(&self, new: Vec<u16>) -> Vec<u8> {
+    let mut out = self.original.clone();
+    // panic!("{}, {}", out.len(), new.len());
+    let offset = self.offset;
+    let n = new.len();
+    web_sys::console::log_1(&format!("n: {}", n).into());
+    for (i, value) in new.into_iter().enumerate() {
+      let bytes = value.to_le_bytes();
+      out[offset + i*2] = bytes[0];
+      out[offset + i*2 + 1] = bytes[1];
+    }
+    out
   }
 }

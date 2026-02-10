@@ -185,9 +185,3 @@ impl fmt::Debug for CFA {
     write!(f, "CFA {{ {} }}", self.name)
   }
 }
-
-impl fmt::Display for CFA {
-  fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-    write!(f, "{}", self.name)
-  }
-}

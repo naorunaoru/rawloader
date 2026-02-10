@@ -68,7 +68,7 @@ impl<'a> Decoder for SrwDecoder<'a> {
       x => return Err(format!("SRW: Don't know how to handle compression {}", x).to_string()),
     };
 
-    ok_image(camera, width, height, self.get_wb()?, image)
+    ok_image(camera, width, height, self.get_wb()?, 0, 0, Encoding::NotImplemented, image)
   }
 }
 
@@ -101,7 +101,7 @@ impl<'a> SrwDecoder<'a> {
 
         // First decode even pixels
         for c in (0..16).step_by(2) {
-          let l = len[c >> 3];
+          let l = len[(c >> 3)];
           let adj = pump.get_ibits_sextended(l);
           let predictor = if dir { // Upward prediction
               out[img_up+col+c]
