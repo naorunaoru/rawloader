@@ -1,0 +1,10 @@
+make = "SONY"
+model = "ILME-FX3"
+clean_make = "Sony"
+clean_model = "ILME-FX3"
+blackpoint = 512
+whitepoint = 16300
+color_matrix = [6912, -2127, -469, -4470, 12175, 2587, -398, 1478, 6492]
+color_pattern = "RGGB"
+crops = [0,0,0,0]
+bps = 8

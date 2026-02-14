@@ -1,0 +1,10 @@
+make = "SONY"
+model = "ILCE-7RM4A"
+clean_make = "Sony"
+clean_model = "ILCE-7RM4A"
+blackpoint = 512
+whitepoint = 16300
+color_matrix = [7662, -2686, -660, -5240, 12965, 2530, -796, 1508, 6167]
+color_pattern = "RGGB"
+crops = [0,0,0,0]
+bps = 8

@@ -1,0 +1,10 @@
+make = "SONY"
+model = "DSC-RX100M5A"
+clean_make = "Sony"
+clean_model = "DSC-RX100M5A"
+blackpoint = 800
+whitepoint = 16300
+color_matrix = [11176, -4700, -965, -4004, 12184, 2032, -763, 1726, 5876]
+color_pattern = "RGGB"
+crops = [0,0,0,0]
+bps = 8

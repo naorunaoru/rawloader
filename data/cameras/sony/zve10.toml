@@ -1,0 +1,10 @@
+make = "SONY"
+model = "ZV-E10"
+clean_make = "Sony"
+clean_model = "ZV-E10"
+blackpoint = 512
+whitepoint = 16300
+color_matrix = [6355, -2067, -490, -3653, 11542, 2400, -406, 1258, 5506]
+color_pattern = "RGGB"
+crops = [0,0,0,0]
+bps = 8

@@ -1,0 +1,10 @@
+make = "SONY"
+model = "ZV-1"
+clean_make = "Sony"
+clean_model = "ZV-1"
+blackpoint = 800
+whitepoint = 16300
+color_matrix = [8280, -2987, -703, -3531, 11645, 2133, -550, 1542, 5312]
+color_pattern = "RGGB"
+crops = [0,0,0,0]
+bps = 8
