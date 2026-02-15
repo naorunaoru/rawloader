@@ -125,7 +125,7 @@ impl<'a> ArwDecoder<'a> {
       currpos += len+8;
     }
 
-    ok_image(camera, width, height, wb_coeffs, offset, 0, Encoding::NotImplemented, image)
+    ok_image(camera, width, height, wb_coeffs, offset, 12, Encoding::NotImplemented, image)
   }
 
   fn image_srf(&self, camera: Camera, dummy: bool) -> Result<RawImage,String> {
