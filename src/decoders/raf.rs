@@ -4,9 +4,6 @@ use crate::decoders::*;
 use crate::decoders::tiff::*;
 use crate::decoders::basics::*;
 
-
-extern crate web_sys;
-
 #[derive(Debug, Clone)]
 pub struct RafDecoder<'a> {
   buffer: &'a [u8],
@@ -61,7 +58,7 @@ impl<'a> Decoder for RafDecoder<'a> {
         }
         return match comp_offset {
           Some(off) => {
-            let image = super::fuji_compressed::decode_fuji_compressed(&src[off..], width, height, dummy)?;
+            let image = fuji_compressed::decode_fuji_compressed(&src[off..], width, height, dummy)?;
             let mut camera = camera;
             // The Fuji compressed decompressor always outputs pixels at a fixed
             // CFA phase (matching rawpy/libraw), which may differ from the phase
@@ -242,7 +239,7 @@ impl Encoder for RafEncoder {
     // panic!("{}, {}", out.len(), new.len());
     let offset = self.offset;
     let n = new.len();
-    web_sys::console::log_1(&format!("n: {}", n).into());
+    let _ = n;
     for (i, value) in new.into_iter().enumerate() {
       let bytes = value.to_le_bytes();
       out[offset + i*2] = bytes[0];

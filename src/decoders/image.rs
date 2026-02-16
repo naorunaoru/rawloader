@@ -46,9 +46,12 @@ pub struct RawImage {
   pub data: RawImageData,
 }
 
+/// The encoding format of the raw image, used to select the correct encoder
 #[derive(Debug, Clone, Copy)]
 pub enum Encoding {
+  /// Fuji RAF format
   Fuji,
+  /// Format without encoder support
   NotImplemented
 }
 

@@ -569,6 +569,7 @@ impl RawLoader {
     self.decode_vec(&vec, false)
   }
 
+  /// Get an encoder for the given encoding type
   pub fn get_encoder(&self, encoding: Encoding, original: Vec<u8>, bps: usize, offset: usize) -> Result<Box<dyn Encoder>, String> {
     match encoding {
       Encoding::Fuji => Ok(Box::new(raf::RafEncoder::new(original, bps, offset))),
@@ -576,6 +577,7 @@ impl RawLoader {
     }
   }
 
+  /// Encode raw image data back into the original format
   pub fn encode(&self, original: Vec<u8>, new: Vec<u16>, bps: usize, offset: usize, encoding: Encoding) -> Result<Vec<u8>, String> {
     let encoder = self.get_encoder(encoding, original, bps, offset)?;
     // panic!("{}", new.len());
