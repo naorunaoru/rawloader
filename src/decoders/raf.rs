@@ -114,6 +114,7 @@ impl<'a> Decoder for RafDecoder<'a> {
               camera.crops[3] = left_skip;
             }
             ok_image(camera, width, height, self.get_wb()?, offset, bps, Encoding::Fuji, image)
+              .map(|mut img| { img.fuji_lens = self.lens_tables(); img })
           },
           None => Err("RAF: Compressed but could not find Fuji compressed header".to_string()),
         };
@@ -153,10 +154,13 @@ impl<'a> Decoder for RafDecoder<'a> {
         offset: offset,
         blackareas: Vec::new(),
         orientation: camera.orientation,
-        encoding: Encoding::Fuji
+        encoding: Encoding::Fuji,
+        // The tables and their frame describe the unrotated readout
+        fuji_lens: None,
       })
     } else {
       ok_image(camera, width, height, self.get_wb()?, offset, bps, Encoding::Fuji, image)
+        .map(|mut img| { img.fuji_lens = self.lens_tables(); img })
     }
   }
 }
@@ -170,6 +174,29 @@ impl<'a> RafDecoder<'a> {
         Ok([levels.get_f32(1), levels.get_f32(0), levels.get_f32(3), NAN])
       },
     }
+  }
+
+  /// The camera's lens correction tables and the crop frame they refer to; None unless the
+  /// file carries all three tables
+  fn lens_tables(&self) -> Option<FujiLensTables> {
+    let values = |tag| self.tiff.find_entry(tag)
+      .map(|entry| (0..entry.count()).map(|i| entry.get_f32(i)).collect::<Vec<f32>>());
+    let distortion = values(Tag::RafGeometricDistortion)?;
+    let ca = values(Tag::RafChromaticAberration)?;
+    let vignetting = values(Tag::RafVignetting)?;
+
+    // The frame comes from the RAF tag directory, which holds the full size (stored as
+    // ImageWidth, height then width) next to the crop tags
+    let mut frame = [0u16; 6];
+    if let Some(dir) = self.tiff.find_first_ifd(Tag::RafCroppedSize) {
+      for (i, tag) in [Tag::ImageWidth, Tag::RafCropTopLeft, Tag::RafCroppedSize].iter().enumerate() {
+        if let Some(entry) = dir.find_entry(*tag) {
+          frame[i*2] = entry.get_u16(0);
+          frame[i*2+1] = entry.get_u16(1);
+        }
+      }
+    }
+    Some(FujiLensTables { distortion, ca, vignetting, frame })
   }
 
   fn rotate_image(src: &[u16], camera: &Camera, width: usize, height: usize, dummy: bool) -> (usize, usize, Vec<u16>) {

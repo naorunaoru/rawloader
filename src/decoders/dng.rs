@@ -81,7 +81,8 @@ impl<'a> Decoder for DngDecoder<'a> {
       bps: 0,
       blackareas: self.get_masked_areas(raw),
       orientation: orientation,
-      encoding: Encoding::NotImplemented
+      encoding: Encoding::NotImplemented,
+      fuji_lens: None,
     })
   }
 }

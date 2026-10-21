@@ -87,7 +87,14 @@ pub enum Tag {
   RafImageLength   = 0xF002,
   RafBitsPerSample = 0xF003,
   RafOffsets       = 0xF007,
+  RafGeometricDistortion = 0xF00B,
   RafWBGRB         = 0xF00E,
+  RafChromaticAberration = 0xF00F,
+  RafVignetting    = 0xF010,
+  // Synthetic keys for the RAF directory's 0x0110 and 0x0111, whose numbers collide with
+  // Model and StripOffsets (see new_fuji)
+  RafCropTopLeft   = 0xF110,
+  RafCroppedSize   = 0xF111,
   KdcWB            = 0xFA2A,
   KdcWidth         = 0xFD00,
   KdcLength        = 0xFD01,
@@ -332,6 +339,26 @@ impl<'a> TiffIFD<'a> {
           parent_offset: 0,
           doffset: off+4,
           data: &buf[off+4..off+12],
+          endian: BIG_ENDIAN,
+        });
+      } else if tag == 0x0110 { // RawImageCropTopLeft: top, then left
+        entries.insert(t(Tag::RafCropTopLeft), TiffEntry {
+          tag: t(Tag::RafCropTopLeft),
+          typ: 3, // Short
+          count: 2,
+          parent_offset: 0,
+          doffset: off+4,
+          data: &buf[off+4..off+8],
+          endian: BIG_ENDIAN,
+        });
+      } else if tag == 0x0111 { // RawImageCroppedSize: height, then width
+        entries.insert(t(Tag::RafCroppedSize), TiffEntry {
+          tag: t(Tag::RafCroppedSize),
+          typ: 3, // Short
+          count: 2,
+          parent_offset: 0,
+          doffset: off+4,
+          data: &buf[off+4..off+8],
           endian: BIG_ENDIAN,
         });
       }

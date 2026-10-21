@@ -44,6 +44,21 @@ pub struct RawImage {
   pub encoding: Encoding,
   /// image data itself, has `width`\*`height`\*`cpp` elements
   pub data: RawImageData,
+  /// the camera's own lens correction tables, when the file carries them (Fuji RAF)
+  pub fuji_lens: Option<FujiLensTables>,
+}
+
+/// The lens correction tables a Fuji RAF carries, and the crop frame they refer to
+#[derive(Debug, Clone)]
+pub struct FujiLensTables {
+  /// geometric distortion parameters (RAF tag 0xF00B), as stored
+  pub distortion: Vec<f32>,
+  /// chromatic aberration parameters (RAF tag 0xF00F), as stored
+  pub ca: Vec<f32>,
+  /// vignetting parameters (RAF tag 0xF010), as stored
+  pub vignetting: Vec<f32>,
+  /// [full height, full width, crop top, crop left, cropped height, cropped width] from the RAF tag directory; zeros when absent
+  pub frame: [u16; 6],
 }
 
 /// The encoding format of the raw image, used to select the correct encoder
@@ -123,7 +138,8 @@ impl RawImage {
       offset: offset,
       blackareas: blackareas,
       orientation: camera.orientation,
-      encoding: encoding
+      encoding: encoding,
+      fuji_lens: None,
     }
   }
 
