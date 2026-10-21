@@ -462,7 +462,7 @@ impl<'a> TiffEntry<'a> {
   pub fn doffset(&self) -> usize { self.doffset }
   pub fn parent_offset(&self) -> usize { self.parent_offset }
   pub fn count(&self) -> usize { self.count }
-  //pub fn typ(&self) -> u16 { self.typ }
+  pub fn typ(&self) -> u16 { self.typ }
 
   pub fn get_u16(&self, idx: usize) -> u16 {
     match self.typ {

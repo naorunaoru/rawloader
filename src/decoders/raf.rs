@@ -177,10 +177,14 @@ impl<'a> RafDecoder<'a> {
   }
 
   /// The camera's lens correction tables and the crop frame they refer to; None unless the
-  /// file carries all three tables
+  /// file carries all three tables, as rationals with finite values
   fn lens_tables(&self) -> Option<FujiLensTables> {
+    // get_f32 panics or reads out of bounds on most non-rational types, and a zero
+    // denominator gives NaN or infinity, so either makes the table absent
     let values = |tag| self.tiff.find_entry(tag)
-      .map(|entry| (0..entry.count()).map(|i| entry.get_f32(i)).collect::<Vec<f32>>());
+      .filter(|entry| entry.typ() == 5 || entry.typ() == 10)
+      .map(|entry| (0..entry.count()).map(|i| entry.get_f32(i)).collect::<Vec<f32>>())
+      .filter(|table| table.iter().all(|v| v.is_finite()));
     let distortion = values(Tag::RafGeometricDistortion)?;
     let ca = values(Tag::RafChromaticAberration)?;
     let vignetting = values(Tag::RafVignetting)?;
