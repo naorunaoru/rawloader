@@ -95,6 +95,7 @@ mod x3f;
 use self::tiff::*;
 pub use self::image::*;
 mod unwrapped;
+mod whitelevel;
 
 pub static CAMERAS_TOML: &'static str = include_str!(concat!(env!("OUT_DIR"), "/all.toml"));
 pub static SAMPLE: &'static str = "\nPlease submit samples at https://raw.pixls.us/";

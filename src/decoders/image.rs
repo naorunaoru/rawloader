@@ -143,6 +143,17 @@ impl RawImage {
     }
   }
 
+  /// White levels measured from the data where the sensor visibly clips below the metadata
+  /// level, in RGBE order (see `whitelevel::calibrate_whitelevels`). Float and multi-component
+  /// images keep their metadata levels.
+  pub fn calibrated_whitelevels(&self) -> [u16;4] {
+    match &self.data {
+      RawImageData::Integer(data) if self.cpp == 1 =>
+        whitelevel::calibrate_whitelevels(data, self.width, self.crops, &self.cfa, self.whitelevels),
+      _ => self.whitelevels,
+    }
+  }
+
   /// Outputs the inverted matrix that converts pixels in the camera colorspace into
   /// XYZ components.
   pub fn cam_to_xyz(&self) -> [[f32;4];3] {
