@@ -23,6 +23,14 @@ impl<'a> Rw2Decoder<'a> {
 
 impl<'a> Decoder for Rw2Decoder<'a> {
   fn image(&self, dummy: bool) -> Result<RawImage,String> {
+    // Raw formats 6–8 (S1 series, GH5S, GH6, S5 II, G9 II) use compression schemes this decoder
+    // doesn't implement; the classic decoder would read past the end of their data.
+    if let Some(entry) = self.tiff.find_entry(Tag::PanaRawFormat) {
+      let format = entry.get_usize(0);
+      if format >= 6 {
+        return Err(format!("Panasonic RW2 raw format {} is not supported", format));
+      }
+    }
     let width: usize;
     let height: usize;
     let image = {

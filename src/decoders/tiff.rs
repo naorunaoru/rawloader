@@ -17,6 +17,7 @@ pub enum Tag {
   PanaWBs2G        = 0x0025,
   PanaWBs2B        = 0x0026,
   Cr2PowerShotWB   = 0x0029,
+  PanaRawFormat    = 0x002D,
   NewSubFileType   = 0x00FE,
   Cr2OldOffset     = 0x0081,
   NefMeta1         = 0x008c,
