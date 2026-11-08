@@ -241,20 +241,65 @@ struct FujiGrads {
 // ---------------------------------------------------------------------------
 // Bitstream
 // ---------------------------------------------------------------------------
-#[inline(always)]
-fn fuji_zerobits(pump: &mut BitPumpMSB) -> i32 {
-    let mut count: i32 = 0;
-    loop {
-        let batch = pump.peek_bits(32);
-        let zeros = batch.leading_zeros() as i32;
-        count += zeros;
-        if zeros < 32 {
-            pump.consume_bits((zeros + 1) as u32);
-            break;
-        }
-        pump.consume_bits(32);
+/// MSB-first bit reader with the unread bits left-aligned in a 64-bit cache (the bits below the
+/// valid ones are zero). Reads past the end of the source return zeros.
+#[derive(Clone, Copy)]
+struct FujiBits<'a> {
+    src: &'a [u8],
+    pos: usize,
+    cache: u64,
+    nbits: u32,
+}
+
+impl<'a> FujiBits<'a> {
+    fn new(src: &'a [u8]) -> FujiBits<'a> {
+        FujiBits { src, pos: 0, cache: 0, nbits: 0 }
     }
-    count
+
+    /// Tops the cache up to at least 32 valid bits.
+    #[inline(always)]
+    fn refill(&mut self) {
+        if self.nbits <= 32 {
+            let word = self.src.get(self.pos..self.pos + 4).map_or(0, |b| u32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            self.cache |= (word as u64) << (32 - self.nbits);
+            self.pos += 4;
+            self.nbits += 32;
+        }
+    }
+
+    /// Consumes 1 ≤ n ≤ 64 bits.
+    #[inline(always)]
+    fn consume(&mut self, n: u32) {
+        self.cache = (self.cache << (n - 1)) << 1;
+        self.nbits -= n;
+    }
+
+    /// Counts zero bits up to the next one bit, and consumes them and the one bit.
+    #[inline(always)]
+    fn zerobits(&mut self) -> i32 {
+        let mut count = 0;
+        loop {
+            self.refill();
+            let zeros = self.cache.leading_zeros();
+            if zeros < self.nbits {
+                self.consume(zeros + 1);
+                return (count + zeros) as i32;
+            }
+            count += self.nbits;
+            self.cache = 0;
+            self.nbits = 0;
+        }
+    }
+
+    /// Reads 0 ≤ n ≤ 32 bits, without a branch on n.
+    #[inline(always)]
+    fn get_bits(&mut self, n: u32) -> u32 {
+        if self.nbits < n { self.refill(); }
+        let value = ((self.cache >> 1) >> (63 - n)) as u32;
+        self.cache <<= n;
+        self.nbits -= n;
+        value
+    }
 }
 
 #[inline(always)]
@@ -302,43 +347,40 @@ fn select_qtable_odd<'a, 'b>(
 
 #[inline(always)]
 fn fuji_decode_sample(
-    pump: &mut BitPumpMSB,
+    pump: &mut FujiBits,
     params: &FujiParams,
     qt: &FujiQTable,
     grad: i32,
     interp_val: i32,
     grads: &mut [GradPair],
 ) -> u16 {
-    let gradient = grad.unsigned_abs() as usize;
-    let sample_bits = fuji_zerobits(pump);
+    let g = &mut grads[grad.unsigned_abs() as usize];
+    let sample_bits = pump.zerobits();
 
     let (code_bits, code_delta): (i32, i32);
     if sample_bits < params.max_bits - qt.raw_bits - 1 {
-        code_bits = bit_diff(grads[gradient].value1, grads[gradient].value2);
+        code_bits = bit_diff(g.value1, g.value2);
         code_delta = sample_bits << code_bits;
     } else {
         code_bits = qt.raw_bits;
         code_delta = 1;
     }
 
-    let mut code = if code_bits > 0 { pump.get_bits(code_bits as u32) as i32 } else { 0 };
-    code += code_delta;
+    let code = pump.get_bits(code_bits as u32) as i32 + code_delta;
 
-    // Zigzag decode
-    code = if code & 1 != 0 { -1 - code / 2 } else { code / 2 };
+    // Zigzag decode (odd codes are negative), without a branch.
+    let code = (code >> 1) ^ -(code & 1);
 
-    // Update gradient statistics
-    grads[gradient].value1 += code.abs();
-    if grads[gradient].value2 == params.min_value {
-        grads[gradient].value1 >>= 1;
-        grads[gradient].value2 >>= 1;
-    }
-    grads[gradient].value2 += 1;
+    // Update gradient statistics (halved once value2 reaches min_value), without a branch.
+    let halve = (g.value2 == params.min_value) as i32;
+    g.value1 = (g.value1 + code.abs()) >> halve;
+    g.value2 = (g.value2 >> halve) + 1;
 
     let q_mult = 2 * qt.q_base + 1;
 
-    // Apply code to interpolation value
-    let mut result = if grad < 0 { interp_val - code * q_mult } else { interp_val + code * q_mult };
+    // Apply code to interpolation value, negated for a negative gradient (without a branch).
+    let sign = grad >> 31;
+    let mut result = interp_val + (((code * q_mult) ^ sign) - sign);
 
     if result < -qt.q_base {
         result += qt.total_values * q_mult;
@@ -379,15 +421,13 @@ fn even_neighbors(
     let d_rf_rb = (rf - rb).abs();
     let d_rd_rb = (rd - rb).abs();
 
-    let (term1, term2);
-    if d_rc_rb > d_rf_rb.max(d_rd_rb) {
-        term1 = rf; term2 = rd;
-    } else {
-        term1 = if d_rd_rb > d_rc_rb.max(d_rf_rb) { rf } else { rd };
-        term2 = rc;
-    }
+    // Two of Rc, Rd, Rf: leave out Rc if it is the outlier, else Rd if it is, else Rf. With
+    // masks, as in odd_neighbors. The two outlier conditions cannot both hold.
+    let rc_out = -((d_rc_rb > d_rf_rb.max(d_rd_rb)) as i32);
+    let rd_out = -((d_rd_rb > d_rc_rb.max(d_rf_rb)) as i32);
+    let left_out = rf + ((rc - rf) & rc_out) + ((rd - rf) & rd_out);
 
-    let interp_val = (2 * rb + term1 + term2) >> 2;
+    let interp_val = (2 * rb + rc + rd + rf - left_out) >> 2;
     // v1 = Rb - Rf, v2 = Rc - Rb, diff_sum = |Rf-Rb| + |Rc-Rb|
     (interp_val, rb - rf, rc - rb, d_rf_rb, d_rc_rb)
 }
@@ -403,12 +443,11 @@ fn odd_neighbors(
     let rd = l(lines, stride, c - 1, 1 + 2 * (col + 1));
     let rg = l(lines, stride, c, 1 + 2 * (col + 1));
 
-    let mut interp_val = ra + rg;
-    if rb < rc.min(rd) || rb > rc.max(rd) {
-        interp_val += 2 * rb;
-        interp_val >>= 1;
-    }
-    interp_val >>= 1;
+    // (Ra + Rg) / 2, or (Ra + Rg + 2 Rb) / 4 when Rb lies outside [Rc, Rd]. A mask rather than
+    // a select, which the wasm engine may compile to a mispredicted branch.
+    let outside = -(((rb < rc.min(rd)) | (rb > rc.max(rd))) as i32);
+    let sum = ra + rg;
+    let interp_val = (sum + sum + ((2 * rb - sum) & outside)) >> 2;
 
     // v1 = Rb - Rc, v2 = Rc - Ra, diff_sum = |Rb-Rc| + |Rc-Ra|
     let diff_rb_rc = (rb - rc).abs();
@@ -451,8 +490,46 @@ fn extend_color(lines: &mut [i32], stride: usize, color: usize) {
 // ---------------------------------------------------------------------------
 // Block decode (6 rows of one MCU line)
 // ---------------------------------------------------------------------------
-fn xtrans_decode_block(
-    pump: &mut BitPumpMSB,
+#[inline(always)]
+fn decode_even<const LOSSLESS: bool>(
+    pump: &mut FujiBits, params: &FujiParams, lines: &mut [i32], stride: usize,
+    c: usize, col: usize, interpolated: bool, grads: &mut FujiGrads,
+) {
+    let (interp_val, v1, v2, d_rf_rb, d_rc_rb) = even_neighbors(lines, stride, c, col);
+    let sample = if interpolated {
+        interp_val.max(0).min(params.max_value) as u16
+    } else if LOSSLESS {
+        let grad = params.quant_gradient(&params.qt[0], v1, v2);
+        fuji_decode_sample(pump, params, &params.qt[0], grad, interp_val, &mut grads.grads)
+    } else {
+        let (qt, grads) = select_qtable_even(params, grads, d_rf_rb + d_rc_rb);
+        let grad = params.quant_gradient(qt, v1, v2);
+        fuji_decode_sample(pump, params, qt, grad, interp_val, grads)
+    };
+    set_l(lines, stride, c, 1 + 2 * col, sample);
+}
+
+#[inline(always)]
+fn decode_odd<const LOSSLESS: bool>(
+    pump: &mut FujiBits, params: &FujiParams, lines: &mut [i32], stride: usize,
+    c: usize, col: usize, grads: &mut FujiGrads,
+) {
+    let (interp_val, v1, v2, diff_sum) = odd_neighbors(lines, stride, c, col);
+    let sample = if LOSSLESS {
+        let grad = params.quant_gradient(&params.qt[0], v1, v2);
+        fuji_decode_sample(pump, params, &params.qt[0], grad, interp_val, &mut grads.grads)
+    } else {
+        let (qt, grads) = select_qtable_odd(params, grads, diff_sum);
+        let grad = params.quant_gradient(qt, v1, v2);
+        fuji_decode_sample(pump, params, qt, grad, interp_val, grads)
+    };
+    set_l(lines, stride, c, 1 + 2 * col + 1, sample);
+}
+
+/// Decodes one 6-row MCU line. In each row, odd samples trail the even ones by 4 columns; both
+/// colour lines of the row share one bitstream, interleaved per column.
+fn xtrans_decode_block<const LOSSLESS: bool>(
+    reader: &mut FujiBits,
     params: &FujiParams,
     lines: &mut [i32],
     stride: usize,
@@ -460,63 +537,31 @@ fn xtrans_decode_block(
     grad_odd: &mut [FujiGrads; 3],
 ) {
     let half_lw = params.line_width / 2;
+    let mut bits = *reader;
+    let pump = &mut bits;
 
     for row in 0..6usize {
         let (c0, c1) = ROW_LINES[row];
-        let grad_idx = row % 3;
+        let ge = &mut grad_even[row % 3];
+        let go = &mut grad_odd[row % 3];
+        // Whether an even sample is interpolated rather than coded depends on the row, the
+        // component and the column's parity only.
+        let interp = [[is_interpolation(row, 0, 0), is_interpolation(row, 0, 1)],
+                      [is_interpolation(row, 1, 0), is_interpolation(row, 1, 1)]];
 
-        let mut col_even = [0usize; 2];
-        let mut col_odd = [0usize; 2];
-
-        for i in 0..(half_lw + 4) {
-            // Decode even pixels
-            if i < half_lw {
-                for comp in 0..2usize {
-                    let c = if comp == 0 { c0 } else { c1 };
-                    let col = col_even[comp];
-
-                    let sample = if is_interpolation(row, comp, i) {
-                        let (interp_val, _, _, _, _) = even_neighbors(lines, stride, c, col);
-                        interp_val.max(0).min(params.max_value) as u16
-                    } else {
-                        let (interp_val, v1, v2, d_rf_rb, d_rc_rb) = even_neighbors(lines, stride, c, col);
-                        if params.lossless {
-                            let grad = params.quant_gradient(&params.qt[0], v1, v2);
-                            fuji_decode_sample(pump, params, &params.qt[0], grad, interp_val, &mut grad_even[grad_idx].grads)
-                        } else {
-                            let diff_sum = d_rf_rb + d_rc_rb;
-                            let (qt, grads) = select_qtable_even(params, &mut grad_even[grad_idx], diff_sum);
-                            let grad = params.quant_gradient(qt, v1, v2);
-                            fuji_decode_sample(pump, params, qt, grad, interp_val, grads)
-                        }
-                    };
-
-                    set_l(lines, stride, c, 1 + 2 * col, sample);
-                    col_even[comp] += 1;
-                }
-            }
-
-            // Decode odd pixels (start 4 positions behind even)
-            if i >= 4 {
-                for comp in 0..2usize {
-                    let c = if comp == 0 { c0 } else { c1 };
-                    let col = col_odd[comp];
-
-                    let sample = if params.lossless {
-                        let (interp_val, v1, v2, _) = odd_neighbors(lines, stride, c, col);
-                        let grad = params.quant_gradient(&params.qt[0], v1, v2);
-                        fuji_decode_sample(pump, params, &params.qt[0], grad, interp_val, &mut grad_odd[grad_idx].grads)
-                    } else {
-                        let (interp_val, v1, v2, diff_sum) = odd_neighbors(lines, stride, c, col);
-                        let (qt, grads) = select_qtable_odd(params, &mut grad_odd[grad_idx], diff_sum);
-                        let grad = params.quant_gradient(qt, v1, v2);
-                        fuji_decode_sample(pump, params, qt, grad, interp_val, grads)
-                    };
-
-                    set_l(lines, stride, c, 1 + 2 * col + 1, sample);
-                    col_odd[comp] += 1;
-                }
-            }
+        for i in 0..half_lw.min(4) {
+            decode_even::<LOSSLESS>(pump, params, lines, stride, c0, i, interp[0][i & 1], ge);
+            decode_even::<LOSSLESS>(pump, params, lines, stride, c1, i, interp[1][i & 1], ge);
+        }
+        for i in 4..half_lw {
+            decode_even::<LOSSLESS>(pump, params, lines, stride, c0, i, interp[0][i & 1], ge);
+            decode_even::<LOSSLESS>(pump, params, lines, stride, c1, i, interp[1][i & 1], ge);
+            decode_odd::<LOSSLESS>(pump, params, lines, stride, c0, i - 4, go);
+            decode_odd::<LOSSLESS>(pump, params, lines, stride, c1, i - 4, go);
+        }
+        for i in half_lw.max(4)..half_lw + 4 {
+            decode_odd::<LOSSLESS>(pump, params, lines, stride, c0, i - 4, go);
+            decode_odd::<LOSSLESS>(pump, params, lines, stride, c1, i - 4, go);
         }
 
         // Extend helper columns
@@ -524,49 +569,47 @@ fn xtrans_decode_block(
         extend_color(lines, stride, ext0);
         extend_color(lines, stride, ext1);
     }
+    *reader = bits;
 }
 
 // ---------------------------------------------------------------------------
 // Copy decoded lines to output image
 // ---------------------------------------------------------------------------
-#[inline(always)]
-fn xtrans_col_index(img_col: usize) -> usize {
-    (((img_col * 2 / 3) & 0x7FFFFFFE) | ((img_col % 3) & 1)) + ((img_col % 3) >> 1)
+/// For each of the 6 rows of an MCU line and each column of the strip, the index of its sample
+/// in the line buffer.
+fn xtrans_copy_map(strip_width: usize, stride: usize) -> Vec<[u32; 6]> {
+    (0..strip_width).map(|img_col| {
+        let buf_col = 1 + ((((img_col * 2 / 3) & 0x7FFFFFFE) | ((img_col % 3) & 1)) + ((img_col % 3) >> 1));
+        let mut rows = [0u32; 6];
+        for (mcu_row, entry) in rows.iter_mut().enumerate() {
+            let row = match XTRANS_CFA[mcu_row][img_col % 6] {
+                0 => R2 + (mcu_row >> 1),
+                1 => G2 + mcu_row,
+                _ => B2 + (mcu_row >> 1),
+            };
+            *entry = (row * stride + buf_col) as u32;
+        }
+        rows
+    }).collect()
 }
 
 fn copy_line_to_xtrans(
     lines: &[i32],
-    stride: usize,
-    strip_width: usize,
+    map: &[[u32; 6]],
     strip_offset_x: usize,
     cur_line: usize,
     out: &mut [u16],
     out_width: usize,
     out_height: usize,
 ) {
-    let num_mcus_x = strip_width / 6;
-
-    for mcu_x in 0..num_mcus_x {
-        for mcu_row in 0..6usize {
-            let out_y = 6 * cur_line + mcu_row;
-            if out_y >= out_height { continue; }
-
-            for mcu_col in 0..6usize {
-                let img_col = 6 * mcu_x + mcu_col;
-                let out_x = strip_offset_x + img_col;
-                if out_x >= out_width { continue; }
-
-                let color = XTRANS_CFA[mcu_row][mcu_col];
-                let row = match color {
-                    0 => R2 + (mcu_row >> 1),       // RED
-                    1 => G2 + mcu_row,               // GREEN
-                    _ => B2 + (mcu_row >> 1),        // BLUE
-                };
-
-                let buf_col = 1 + xtrans_col_index(img_col);
-                let val = lines[row * stride + buf_col];
-                out[out_y * out_width + out_x] = val as u16;
-            }
+    if strip_offset_x >= out_width { return; }
+    let width = map.len().min(out_width - strip_offset_x);
+    for mcu_row in 0..6usize {
+        let out_y = 6 * cur_line + mcu_row;
+        if out_y >= out_height { break; }
+        let dst = &mut out[out_y * out_width + strip_offset_x..][..width];
+        for (d, m) in dst.iter_mut().zip(map) {
+            *d = lines[m[mcu_row] as usize] as u16;
         }
     }
 }
@@ -610,6 +653,8 @@ fn decode_strip(
 ) {
     let stride = params.line_width + 2;
     let mut lines = vec![0i32; LTOTAL * stride];
+    // Only whole MCUs are copied out, as before.
+    let map = xtrans_copy_map(strip_width / 6 * 6, stride);
 
     let init_gp = GradPair { value1: 0, value2: 0 };
     let init_fg = FujiGrads { grads: [init_gp; 41], lossy_grads: [[init_gp; 5]; 3] };
@@ -622,10 +667,10 @@ fn decode_strip(
         init_lossy_grads(params, &mut grad_even, &mut grad_odd);
     }
 
-    // Pad source for safe BitPump reads near end
+    // Padded so a strip that ends mid-word is still read in full.
     let mut padded = src.to_vec();
     padded.extend_from_slice(&[0u8; 16]);
-    let mut pump = BitPumpMSB::new(&padded);
+    let mut pump = FujiBits::new(&padded);
 
     for cur_line in 0..header.total_lines {
         // For lossy: re-init main qtable and grads when q_base changes
@@ -641,10 +686,7 @@ fn decode_strip(
             // Rotate: last 2 lines of each color → first 2
             for &(start, count) in &COLOR_RANGES {
                 let src_off = (start + count - 2) * stride;
-                let dst_off = start * stride;
-                for i in 0..(2 * stride) {
-                    lines[dst_off + i] = lines[src_off + i];
-                }
+                lines.copy_within(src_off..src_off + 2 * stride, start * stride);
             }
             // Set helper column for first decoded line
             for &(start, _) in &COLOR_RANGES {
@@ -654,8 +696,12 @@ fn decode_strip(
             }
         }
 
-        xtrans_decode_block(&mut pump, params, &mut lines, stride, &mut grad_even, &mut grad_odd);
-        copy_line_to_xtrans(&lines, stride, strip_width, strip_offset_x, cur_line, out, out_width, out_height);
+        if params.lossless {
+            xtrans_decode_block::<true>(&mut pump, params, &mut lines, stride, &mut grad_even, &mut grad_odd);
+        } else {
+            xtrans_decode_block::<false>(&mut pump, params, &mut lines, stride, &mut grad_even, &mut grad_odd);
+        }
+        copy_line_to_xtrans(&lines, &map, strip_offset_x, cur_line, out, out_width, out_height);
     }
 }
 
