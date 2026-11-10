@@ -274,7 +274,14 @@ impl<'a> FujiBits<'a> {
         self.nbits -= n;
     }
 
-    /// Counts zero bits up to the next one bit, and consumes them and the one bit.
+    /// Whether a word wholly past the end of the source has been loaded. A reader of a valid
+    /// stream stays within the 16 bytes of padding its source is given.
+    fn overran(&self) -> bool {
+        self.pos > self.src.len()
+    }
+
+    /// Counts zero bits up to the next one bit, and consumes them and the one bit. A run that
+    /// goes past the end of the source stops there instead of counting zeros forever.
     #[inline(always)]
     fn zerobits(&mut self) -> i32 {
         let mut count = 0;
@@ -288,6 +295,9 @@ impl<'a> FujiBits<'a> {
             count += self.nbits;
             self.cache = 0;
             self.nbits = 0;
+            if self.pos > self.src.len() {
+                return count as i32;
+            }
         }
     }
 
@@ -650,7 +660,7 @@ fn decode_strip(
     out: &mut [u16],
     out_width: usize,
     out_height: usize,
-) {
+) -> Result<(), String> {
     let stride = params.line_width + 2;
     let mut lines = vec![0i32; LTOTAL * stride];
     // Only whole MCUs are copied out, as before.
@@ -701,8 +711,13 @@ fn decode_strip(
         } else {
             xtrans_decode_block::<false>(&mut pump, params, &mut lines, stride, &mut grad_even, &mut grad_odd);
         }
+        // A corrupt strip: its bitstream lost sync and ran off the end.
+        if pump.overran() {
+            return Err("RAF compressed: strip data ended early".to_string());
+        }
         copy_line_to_xtrans(&lines, &map, strip_offset_x, cur_line, out, out_width, out_height);
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -803,10 +818,39 @@ pub fn decode_fuji_compressed(src: &[u8], width: usize, height: usize, dummy: bo
 
         let strip_q_bases = q_bases.as_ref().map(|qb| &qb[block * line_step..]);
 
-        decode_strip(strip_src, &header, &mut params, strip_q_bases, strip_width, strip_offset_x, &mut out, width, height);
+        decode_strip(strip_src, &header, &mut params, strip_q_bases, strip_width, strip_offset_x, &mut out, width, height)?;
 
         data_off = strip_end;
     }
 
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn zerobits_gives_up_when_the_source_runs_out() {
+        // A strip whose bitstream has lost sync ends in zeros that no one bit follows.
+        let mut bits = FujiBits::new(&[0u8; 8]);
+        bits.zerobits();
+        assert!(bits.overran());
+        // Later reads return at once and stay past the end.
+        assert_eq!(bits.get_bits(12), 0);
+        bits.zerobits();
+        assert!(bits.overran());
+    }
+
+    #[test]
+    fn zerobits_counts_runs_within_and_across_words_without_an_overrun() {
+        // 31 zeros and a one; a one at once; 40 zeros and a one; then 0b101.
+        let src = [0, 0, 0, 1, 0x80, 0, 0, 0, 0, 0x40 | 0x28, 0, 0];
+        let mut bits = FujiBits::new(&src);
+        assert_eq!(bits.zerobits(), 31);
+        assert_eq!(bits.zerobits(), 0);
+        assert_eq!(bits.zerobits(), 40);
+        assert_eq!(bits.get_bits(3), 0b101);
+        assert!(!bits.overran());
+    }
 }
