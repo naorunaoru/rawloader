@@ -79,6 +79,7 @@ mod dcs;
 mod rw2;
 mod raf;
 pub mod fuji_compressed;
+pub use self::fuji_compressed::FujiStrip;
 mod dcr;
 mod dng;
 mod pef;
@@ -103,6 +104,32 @@ pub static BUG: &'static str = "\nPlease file a bug with a sample file at https:
 
 pub trait Decoder {
   fn image(&self, dummy: bool) -> Result<RawImage, String>;
+
+  /// The strips of a file whose pixels can be decoded strip by strip outside this decoder (a
+  /// compressed Fuji RAF); None for any other file
+  fn fuji_strips(&self) -> Result<Option<FujiStrips>, String> {
+    Ok(None)
+  }
+
+  /// `image(false)` for a file `fuji_strips` describes, with its pixels already decoded: the
+  /// strips' blocks, assembled into `width`*`height` values
+  fn image_with_fuji_pixels(&self, _pixels: Vec<u16>) -> Result<RawImage, String> {
+    Err("Not a file that is decoded in strips".to_string())
+  }
+}
+
+/// A compressed Fuji RAF as strips that decode independently of each other, each with
+/// `fuji_compressed::decode_fuji_strip`. Byte ranges and offsets count from the start of the file.
+#[derive(Debug, Clone)]
+pub struct FujiStrips {
+  /// Image width
+  pub width: usize,
+  /// Image height
+  pub height: usize,
+  /// Offset of the 16-byte header of the compressed data
+  pub header: usize,
+  /// The strips, left to right
+  pub strips: Vec<FujiStrip>,
 }
 
 pub trait Encoder {
@@ -527,10 +554,33 @@ impl RawLoader {
 
   /// Decodes an input into a RawImage
   pub fn decode(&self, reader: &mut dyn Read, dummy: bool) -> Result<RawImage,String> {
-    let buffer = Buffer::new(reader)?;
+    self.decode_buffer(&Buffer::new(reader)?, dummy)
+  }
 
+  /// Decodes a buffer into a RawImage
+  pub fn decode_buffer(&self, buffer: &Buffer, dummy: bool) -> Result<RawImage,String> {
     match panic::catch_unwind(|| {
-      self.decode_unsafe(&buffer, dummy)
+      self.decode_unsafe(buffer, dummy)
+    }) {
+      Ok(val) => val,
+      Err(_) => Err(format!("Caught a panic while decoding.{}", BUG).to_string()),
+    }
+  }
+
+  /// The strips of a compressed Fuji RAF; None for any other file
+  pub fn fuji_strips(&self, buffer: &Buffer) -> Result<Option<FujiStrips>, String> {
+    match panic::catch_unwind(|| {
+      self.get_decoder(buffer)?.fuji_strips()
+    }) {
+      Ok(val) => val,
+      Err(_) => Err(format!("Caught a panic while decoding.{}", BUG).to_string()),
+    }
+  }
+
+  /// Decodes a compressed Fuji RAF whose strips were decoded elsewhere into a RawImage
+  pub fn decode_with_fuji_pixels(&self, buffer: &Buffer, pixels: Vec<u16>) -> Result<RawImage,String> {
+    match panic::catch_unwind(|| {
+      self.get_decoder(buffer)?.image_with_fuji_pixels(pixels)
     }) {
       Ok(val) => val,
       Err(_) => Err(format!("Caught a panic while decoding.{}", BUG).to_string()),

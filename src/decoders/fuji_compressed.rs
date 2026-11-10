@@ -4,6 +4,8 @@
 ///   Alexey Danilchenko, Alex Tutubalin, Uwe Müssel, Roman Lebedev
 /// Licensed under LGPL-2.1+
 
+use std::ops::Range;
+
 use crate::decoders::basics::*;
 
 // Line buffer row indices (18 total = 5R + 8G + 5B)
@@ -58,6 +60,46 @@ struct FujiHeader {
     lossless: bool,
 }
 
+impl FujiHeader {
+    /// Parses the header (big-endian, 16 bytes) at the start of `src`.
+    fn parse(src: &[u8]) -> Result<FujiHeader, String> {
+        if src.len() < 16 {
+            return Err("RAF compressed: data too short".to_string());
+        }
+
+        let signature = BEu16(src, 0);
+        let version = src[2];
+        let raw_type = src[3];
+
+        if signature != 0x4953 {
+            return Err(format!("RAF compressed: bad header sig=0x{:04x}", signature));
+        }
+        let lossless = match version {
+            1 => true,
+            0 => false,
+            _ => return Err(format!("RAF compressed: unknown version={}", version)),
+        };
+        if raw_type != 16 {
+            return Err(format!("RAF compressed: only X-Trans supported, got raw_type={}", raw_type));
+        }
+
+        let raw_bits = src[4] as usize;
+        let raw_height = BEu16(src, 5) as usize;
+        let raw_width = BEu16(src, 9) as usize;
+        let block_size = BEu16(src, 11) as usize;
+        let blocks_in_row = src[13] as usize;
+        let total_lines = BEu16(src, 14) as usize;
+
+        if block_size == 0 || blocks_in_row == 0 || total_lines == 0 || raw_bits == 0 || raw_bits > 16 {
+            return Err("RAF compressed: invalid header dimensions".to_string());
+        }
+
+        Ok(FujiHeader {
+            raw_bits, raw_height, raw_width, block_size, blocks_in_row, total_lines, lossless,
+        })
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Quantization table (one per gradient level)
 // ---------------------------------------------------------------------------
@@ -74,6 +116,7 @@ struct FujiQTable {
 // ---------------------------------------------------------------------------
 // Fuji params
 // ---------------------------------------------------------------------------
+#[derive(Clone)]
 struct FujiParams {
     qt: [FujiQTable; 4],  // qt[0] = main, qt[1..3] = lossy sub-tables
     max_bits: i32,
@@ -650,17 +693,29 @@ fn init_lossy_grads(params: &FujiParams, grad_even: &mut [FujiGrads; 3], grad_od
 // ---------------------------------------------------------------------------
 // Strip decoder
 // ---------------------------------------------------------------------------
+/// Decodes one strip into columns `strip_offset_x..` of `out`. Nothing is carried from one strip
+/// to the next: the line buffer, gradients and bit reader are made here, and the strip works on
+/// its own copy of `params` (a lossy strip rebuilds the main table as it goes), so strips can be
+/// decoded in any order, or apart from each other. `q_bases` is the strip's own row of per-line
+/// values, and is only read in a lossy file.
 fn decode_strip(
     src: &[u8],
     header: &FujiHeader,
-    params: &mut FujiParams,
-    q_bases: Option<&[u8]>,
+    params: &FujiParams,
+    q_bases: &[u8],
     strip_width: usize,
     strip_offset_x: usize,
     out: &mut [u16],
     out_width: usize,
     out_height: usize,
 ) -> Result<(), String> {
+    if strip_width > header.block_size {
+        return Err("RAF compressed: invalid strip width".to_string());
+    }
+    if !header.lossless && q_bases.len() < header.total_lines {
+        return Err("RAF compressed: data too short for q_bases".to_string());
+    }
+    let params = &mut params.clone();
     let stride = params.line_width + 2;
     let mut lines = vec![0i32; LTOTAL * stride];
     // Only whole MCUs are copied out, as before.
@@ -685,7 +740,7 @@ fn decode_strip(
     for cur_line in 0..header.total_lines {
         // For lossy: re-init main qtable and grads when q_base changes
         if !params.lossless {
-            let q_base = q_bases.map_or(0, |qb| qb[cur_line] as i32);
+            let q_base = q_bases[cur_line] as i32;
             if cur_line == 0 || q_base != params.qt[0].q_base {
                 params.reinit_main_qtable(q_base);
                 init_main_grads(params, &mut grad_even, &mut grad_odd);
@@ -723,107 +778,113 @@ fn decode_strip(
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
+/// One strip of a compressed image: where its data lies, and which columns of the image it
+/// fills. The strips of an image decode independently of each other.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FujiStrip {
+    /// Byte range of the strip's bitstream
+    pub data: Range<usize>,
+    /// Byte range of the strip's own row of q_bases; empty in a lossless file
+    pub q_bases: Range<usize>,
+    /// Width the strip is coded at
+    pub strip_width: usize,
+    /// First image column the strip fills
+    pub x: usize,
+    /// Number of image columns the strip fills
+    pub cols: usize,
+}
+
+/// The strips of the compressed data at `src`, which holds a `width` pixel wide image. Byte
+/// ranges count from the start of `src`; the header is its first 16 bytes.
+pub fn fuji_strips(src: &[u8], width: usize) -> Result<Vec<FujiStrip>, String> {
+    strip_layout(&FujiHeader::parse(src)?, src, width)
+}
+
+fn strip_layout(header: &FujiHeader, src: &[u8], width: usize) -> Result<Vec<FujiStrip>, String> {
+    let blocks = header.blocks_in_row;
+
+    // Block sizes, then alignment padding
+    let raw_offset = 4 * blocks;
+    if 16 + raw_offset > src.len() {
+        return Err("RAF compressed: data too short for block sizes".to_string());
+    }
+    let padding = if raw_offset & 0xF != 0 { 0x10 - (raw_offset & 0xF) } else { 0 };
+    let mut data_off = 16 + raw_offset + padding;
+
+    // q_bases for lossy: one row of line_step bytes per strip
+    let line_step = (header.total_lines + 0xF) & !0xF;
+    let q_bases_off = data_off;
+    if !header.lossless {
+        data_off += blocks * line_step;
+        if data_off > src.len() {
+            return Err("RAF compressed: data too short for q_bases".to_string());
+        }
+    }
+
+    let mut strips = Vec::with_capacity(blocks);
+    for block in 0..blocks {
+        let strip_end = data_off + BEu32(src, 16 + block * 4) as usize;
+        if strip_end > src.len() {
+            return Err("RAF compressed: strip data extends beyond buffer".to_string());
+        }
+        let x = header.block_size * block;
+        let strip_width = if block + 1 < blocks {
+            header.block_size
+        } else {
+            match header.raw_width.checked_sub(x) {
+                Some(w) if w <= header.block_size => w,
+                _ => return Err("RAF compressed: invalid strip width".to_string()),
+            }
+        };
+        let q_bases = if header.lossless {
+            0..0
+        } else {
+            q_bases_off + block * line_step..q_bases_off + (block + 1) * line_step
+        };
+        strips.push(FujiStrip {
+            data: data_off..strip_end,
+            q_bases,
+            strip_width,
+            x,
+            // Only whole MCUs are copied out
+            cols: (strip_width / 6 * 6).min(width.saturating_sub(x)),
+        });
+        data_off = strip_end;
+    }
+    Ok(strips)
+}
+
 pub fn decode_fuji_compressed(src: &[u8], width: usize, height: usize, dummy: bool) -> Result<Vec<u16>, String> {
     if dummy {
         return Ok(vec![0; 1]);
     }
 
-    // Parse header (big-endian, 16 bytes)
-    if src.len() < 16 {
-        return Err("RAF compressed: data too short".to_string());
-    }
+    let header = FujiHeader::parse(src)?;
+    let strips = strip_layout(&header, src, width)?;
+    let params = FujiParams::new(&header)?;
 
-    let signature = BEu16(src, 0);
-    let version = src[2];
-    let raw_type = src[3];
-
-    if signature != 0x4953 {
-        return Err(format!("RAF compressed: bad header sig=0x{:04x}", signature));
-    }
-    let lossless = match version {
-        1 => true,
-        0 => false,
-        _ => return Err(format!("RAF compressed: unknown version={}", version)),
-    };
-    if raw_type != 16 {
-        return Err(format!("RAF compressed: only X-Trans supported, got raw_type={}", raw_type));
-    }
-
-    let raw_bits = src[4] as usize;
-    let raw_height = BEu16(src, 5) as usize;
-    let raw_width = BEu16(src, 9) as usize;
-    let block_size = BEu16(src, 11) as usize;
-    let blocks_in_row = src[13] as usize;
-    let total_lines = BEu16(src, 14) as usize;
-
-    if block_size == 0 || blocks_in_row == 0 || total_lines == 0 {
-        return Err("RAF compressed: invalid header dimensions".to_string());
-    }
-
-    let header = FujiHeader {
-        raw_bits, raw_height, raw_width, block_size, blocks_in_row, total_lines, lossless,
-    };
-    let mut params = FujiParams::new(&header)?;
-
-    // Read block sizes
-    let bs_off = 16;
-    let mut block_sizes = Vec::with_capacity(blocks_in_row);
-    for i in 0..blocks_in_row {
-        let off = bs_off + i * 4;
-        if off + 4 > src.len() {
-            return Err("RAF compressed: data too short for block sizes".to_string());
-        }
-        block_sizes.push(BEu32(src, off) as usize);
-    }
-
-    // Compute offset after block sizes (with alignment padding)
-    let raw_offset = 4 * blocks_in_row;
-    let padding = if raw_offset & 0xF != 0 { 0x10 - (raw_offset & 0xF) } else { 0 };
-    let mut data_off = 16 + raw_offset + padding;
-
-    // Read q_bases for lossy
-    let q_bases: Option<Vec<u8>> = if !lossless {
-        let line_step = (total_lines + 0xF) & !0xF;
-        let total_q_bases = blocks_in_row * line_step;
-        if data_off + total_q_bases > src.len() {
-            return Err("RAF compressed: data too short for q_bases".to_string());
-        }
-        let qb = src[data_off..data_off + total_q_bases].to_vec();
-        data_off += total_q_bases;
-        Some(qb)
-    } else {
-        None
-    };
-
-    // Allocate output
     let mut out = vec![0u16; width * height];
-
-    let line_step = (total_lines + 0xF) & !0xF;
-
-    // Decode each strip
-    for block in 0..blocks_in_row {
-        let strip_size = block_sizes[block];
-        let strip_end = data_off + strip_size;
-        if strip_end > src.len() {
-            return Err("RAF compressed: strip data extends beyond buffer".to_string());
-        }
-
-        let strip_src = &src[data_off..strip_end];
-        let strip_width = if block + 1 < blocks_in_row {
-            block_size
-        } else {
-            raw_width - block_size * block
-        };
-        let strip_offset_x = block_size * block;
-
-        let strip_q_bases = q_bases.as_ref().map(|qb| &qb[block * line_step..]);
-
-        decode_strip(strip_src, &header, &mut params, strip_q_bases, strip_width, strip_offset_x, &mut out, width, height)?;
-
-        data_off = strip_end;
+    for strip in &strips {
+        decode_strip(&src[strip.data.clone()], &header, &params, &src[strip.q_bases.clone()], strip.strip_width, strip.x, &mut out, width, height)?;
     }
-
     Ok(out)
+}
+
+/// Decodes one strip on its own, into a block of its `cols` columns for `height` rows (row by
+/// row). `header` is the 16 bytes at the start of the compressed data; `data`, `q_bases`,
+/// `strip_width` and `cols` are what `fuji_strips` gives for the strip. The arguments are
+/// checked here, since they may come from another thread or process.
+pub fn decode_fuji_strip(header: &[u8], data: &[u8], q_bases: &[u8], strip_width: usize, cols: usize, height: usize) -> Result<Vec<u16>, String> {
+    let header = FujiHeader::parse(header)?;
+    if cols > strip_width {
+        return Err("RAF compressed: invalid strip width".to_string());
+    }
+    let mut block = Vec::new();
+    let len = cols.checked_mul(height).filter(|&len| block.try_reserve_exact(len).is_ok())
+        .ok_or_else(|| "RAF compressed: strip block too large".to_string())?;
+    block.resize(len, 0u16);
+    decode_strip(data, &header, &FujiParams::new(&header)?, q_bases, strip_width, 0, &mut block, cols, height)?;
+    Ok(block)
 }
 
 #[cfg(test)]
@@ -840,6 +901,61 @@ mod tests {
         assert_eq!(bits.get_bits(12), 0);
         bits.zerobits();
         assert!(bits.overran());
+    }
+
+    /// A header for a 14-bit image of 8 strips of 768 columns and 673 MCU lines.
+    fn header(lossless: bool) -> [u8; 16] {
+        [0x49, 0x53, lossless as u8, 16, 14, 0x0F, 0xC6, 0, 0, 0x17, 0xA0, 0x03, 0x00, 8, 0x02, 0xA1]
+    }
+
+    #[test]
+    fn a_strip_with_arguments_that_do_not_fit_its_header_is_refused() {
+        let h = header(true);
+        let refused = |r: Result<Vec<u16>, String>| r.expect_err("must be refused");
+        assert!(refused(decode_fuji_strip(&h[..8], &[], &[], 768, 768, 6)).contains("too short"));
+        assert!(refused(decode_fuji_strip(&[0u8; 16], &[], &[], 768, 768, 6)).contains("bad header"));
+        // Wider than the header's strips, more columns than the strip has, a block no memory holds
+        assert!(refused(decode_fuji_strip(&h, &[], &[], 769, 768, 6)).contains("strip width"));
+        assert!(refused(decode_fuji_strip(&h, &[], &[], 768, 769, 6)).contains("strip width"));
+        assert!(refused(decode_fuji_strip(&h, &[], &[], 768, 768, usize::MAX / 2)).contains("too large"));
+        // A lossy strip needs a q_base for each of its lines
+        assert!(refused(decode_fuji_strip(&header(false), &[], &[0u8; 672], 768, 768, 6)).contains("q_bases"));
+    }
+
+    #[test]
+    fn a_strip_without_its_data_ends_early_instead_of_decoding_zeros() {
+        assert!(decode_fuji_strip(&header(true), &[], &[], 768, 768, 4038).unwrap_err().contains("ended early"));
+        assert!(decode_fuji_strip(&header(false), &[], &[0u8; 673], 768, 768, 4038).unwrap_err().contains("ended early"));
+    }
+
+    #[test]
+    fn strips_are_laid_out_from_the_block_sizes_and_cut_to_the_image_width() {
+        // 8 block sizes of 5 bytes, no padding (32 bytes of sizes), then the 40 bytes of strips
+        let mut src = header(true).to_vec();
+        for _ in 0..8 { src.extend_from_slice(&[0, 0, 0, 5]); }
+        src.extend_from_slice(&[0u8; 40]);
+        let strips = fuji_strips(&src, 6048).unwrap();
+        assert_eq!(strips.len(), 8);
+        assert_eq!(strips[0], FujiStrip { data: 48..53, q_bases: 0..0, strip_width: 768, x: 0, cols: 768 });
+        // The last strip is 6048 - 7 * 768 = 672 columns wide
+        assert_eq!(strips[7], FujiStrip { data: 83..88, q_bases: 0..0, strip_width: 672, x: 5376, cols: 672 });
+        // A narrower image cuts the strips that cross its right edge
+        assert_eq!(fuji_strips(&src, 5400).unwrap().iter().map(|s| s.cols).collect::<Vec<_>>(), [768, 768, 768, 768, 768, 768, 768, 24]);
+
+        src.truncate(87);
+        assert!(fuji_strips(&src, 6048).unwrap_err().contains("beyond buffer"));
+        // A lossy file has a row of q_bases per strip (673 lines, rounded up to 688) before the strips
+        let mut lossy = header(false).to_vec();
+        for _ in 0..8 { lossy.extend_from_slice(&[0, 0, 0, 5]); }
+        lossy.extend_from_slice(&vec![0u8; 8 * 688 + 40]);
+        let strips = fuji_strips(&lossy, 6048).unwrap();
+        assert_eq!((strips[1].q_bases.clone(), strips[1].data.clone()), (48 + 688..48 + 2 * 688, 48 + 8 * 688 + 5..48 + 8 * 688 + 10));
+        // A header whose strips can't make up its width
+        let mut bad = header(true).to_vec();
+        bad[9] = 0x30;
+        for _ in 0..8 { bad.extend_from_slice(&[0, 0, 0, 5]); }
+        bad.extend_from_slice(&[0u8; 40]);
+        assert!(fuji_strips(&bad, 6048).unwrap_err().contains("strip width"));
     }
 
     #[test]

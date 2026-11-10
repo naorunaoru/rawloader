@@ -49,6 +49,7 @@
 use lazy_static::lazy_static;
 mod decoders;
 pub use decoders::{RawImage, RawImageData, Orientation, cfa::CFA, Encoding};
+pub use decoders::{FujiStrip, FujiStrips};
 #[doc(hidden)] pub use decoders::Buffer;
 #[doc(hidden)] pub use decoders::RawLoader;
 
@@ -117,6 +118,31 @@ pub fn decode_file<P: AsRef<Path>>(path: P) -> Result<RawImage,RawLoaderError> {
 /// ```
 pub fn decode(reader: &mut dyn Read) -> Result<RawImage,RawLoaderError> {
   LOADER.decode(reader, false).map_err(|err| RawLoaderError::new(err))
+}
+
+/// `decode` for a file already read into a buffer
+pub fn decode_buffer(buffer: &Buffer) -> Result<RawImage,RawLoaderError> {
+  LOADER.decode_buffer(buffer, false).map_err(|err| RawLoaderError::new(err))
+}
+
+/// The strips of a compressed Fuji RAF, for decoding them outside this crate, in parallel: decode
+/// each with `decode_fuji_strip`, copy each block into its columns of a `width`*`height` image,
+/// and pass that to `decode_with_fuji_pixels`. None for any other file.
+pub fn fuji_strips(buffer: &Buffer) -> Result<Option<FujiStrips>,RawLoaderError> {
+  LOADER.fuji_strips(buffer).map_err(|err| RawLoaderError::new(err))
+}
+
+/// Decodes one strip of a compressed Fuji RAF into a block of its `cols` columns for `height`
+/// rows (row by row). `header` is the 16 bytes at `FujiStrips::header`; the rest is the strip's
+/// data and its `FujiStrip` fields.
+pub fn decode_fuji_strip(header: &[u8], data: &[u8], q_bases: &[u8], strip_width: usize, cols: usize, height: usize) -> Result<Vec<u16>,RawLoaderError> {
+  decoders::fuji_compressed::decode_fuji_strip(header, data, q_bases, strip_width, cols, height).map_err(|err| RawLoaderError::new(err))
+}
+
+/// `decode` for a compressed Fuji RAF whose pixels were decoded strip by strip (see
+/// `fuji_strips`); everything but the decompression happens here
+pub fn decode_with_fuji_pixels(buffer: &Buffer, pixels: Vec<u16>) -> Result<RawImage,RawLoaderError> {
+  LOADER.decode_with_fuji_pixels(buffer, pixels).map_err(|err| RawLoaderError::new(err))
 }
 
 // Used to force lazy_static initializations. Useful for fuzzing.
